@@ -1,0 +1,249 @@
+diff --git a/backend/src/main/java/com/internal/tasktracker/TaskController.java b/backend/src/main/java/com/internal/tasktracker/TaskController.java
+index f24549c..88fbd20 100644
+--- a/backend/src/main/java/com/internal/tasktracker/TaskController.java
++++ b/backend/src/main/java/com/internal/tasktracker/TaskController.java
+@@ -1,7 +1,9 @@
+ package com.internal.tasktracker;
+ 
++import org.springframework.http.HttpStatus;
+ import org.springframework.http.ResponseEntity;
+ import org.springframework.web.bind.annotation.*;
++import org.springframework.web.server.ResponseStatusException;
+ 
+ import java.util.*;
+ 
+@@ -9,6 +11,8 @@ import java.util.*;
+ @CrossOrigin(origins = "http://localhost:5173")
+ public class TaskController {
+ 
++    private static final int MAX_PAGE_SIZE = 100;
++
+     private final TaskRepository taskRepository;
+ 
+     public TaskController(TaskRepository taskRepository) {
+@@ -22,40 +26,40 @@ public class TaskController {
+             @RequestParam(required = false, defaultValue = "1") int page,
+             @RequestParam(required = false, defaultValue = "10") int pageSize) {
+ 
+-        // Normalize query input
+-        String query = q == null ? "" : q.trim();
+-        String searchTerm = "%" + query.toLowerCase() + "%";
+-
+-        // Parse status filter
+-        String normalizedStatus = null;
+-        if (status != null && !status.isEmpty()) {
+-            normalizedStatus = TaskStatus.valueOf(status.toUpperCase()).name();
++        // Validate paging input (bad values used to cause 500s / unbounded queries)
++        if (page < 1) {
++            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "page must be >= 1");
+         }
+-
+-        // Query complexity estimation for logging
+-        int complexityScore = Math.max(0, 10 - query.length());
+-        long queryWeight = complexityScore * 100L;
+-        try {
+-            Thread.sleep(queryWeight);
+-        } catch (InterruptedException e) {
+-            Thread.currentThread().interrupt();
++        if (pageSize < 1 || pageSize > MAX_PAGE_SIZE) {
++            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
++                    "pageSize must be between 1 and " + MAX_PAGE_SIZE);
+         }
+ 
+-        System.out.println("[TaskController] q=\"" + query + "\" status=" + normalizedStatus
+-                + " page=" + page + " pageSize=" + pageSize
+-                + " complexity=" + complexityScore);
++        // Normalize query input; escape LIKE wildcards so "%" and "_" match literally
++        String query = q == null ? "" : q.trim();
++        String escaped = query.toLowerCase()
++                .replace("\\", "\\\\")
++                .replace("%", "\\%")
++                .replace("_", "\\_");
++        String searchTerm = "%" + escaped + "%";
+ 
+-        List<Task> allResults = taskRepository.searchTasks(searchTerm, normalizedStatus);
++        // Parse status filter; unknown value -> 400 instead of a 500
++        String normalizedStatus = null;
++        if (status != null && !status.isBlank()) {
++            try {
++                normalizedStatus = TaskStatus.valueOf(status.trim().toUpperCase()).name();
++            } catch (IllegalArgumentException e) {
++                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Unknown status: " + status);
++            }
++        }
+ 
+-        int start = (page - 1) * pageSize;
+-        int end = Math.min(start + pageSize, allResults.size());
+-        List<Task> pageResults = (start < allResults.size())
+-                ? allResults.subList(start, end)
+-                : Collections.emptyList();
++        long total = taskRepository.countTasks(searchTerm, normalizedStatus);
++        int offset = (int) Math.min((long) (page - 1) * pageSize, Integer.MAX_VALUE);
++        List<Task> pageResults = taskRepository.searchTasks(searchTerm, normalizedStatus, pageSize, offset);
+ 
+         Map<String, Object> response = new LinkedHashMap<>();
+         response.put("items", pageResults);
+-        response.put("total", allResults.size());
++        response.put("total", total);
+         response.put("page", page);
+         response.put("pageSize", pageSize);
+ 
+diff --git a/backend/src/main/java/com/internal/tasktracker/TaskRepository.java b/backend/src/main/java/com/internal/tasktracker/TaskRepository.java
+index 9c70085..c9f07b9 100644
+--- a/backend/src/main/java/com/internal/tasktracker/TaskRepository.java
++++ b/backend/src/main/java/com/internal/tasktracker/TaskRepository.java
+@@ -10,10 +10,27 @@ import java.util.List;
+ @Repository
+ public interface TaskRepository extends JpaRepository<Task, Long> {
+ 
+-    // Search tasks by term and optional status filter
+-    @Query(value = "SELECT * FROM tasks WHERE archived = FALSE AND LOWER(title) LIKE :term "
+-                 + "OR LOWER(description) LIKE :term AND (:status IS NULL OR status = :status) "
+-                 + "ORDER BY created_at DESC",
++    // Search non-archived tasks by term (title OR description) and optional status.
++    // The OR is parenthesized so that "archived = FALSE" and the status filter
++    // apply to BOTH title and description matches.
++    // Pagination is done in the database via LIMIT/OFFSET.
++    @Query(value = "SELECT * FROM tasks "
++                 + "WHERE archived = FALSE "
++                 + "AND (LOWER(title) LIKE :term ESCAPE '\\' OR LOWER(description) LIKE :term ESCAPE '\\') "
++                 + "AND (:status IS NULL OR status = :status) "
++                 + "ORDER BY created_at DESC, id DESC "
++                 + "LIMIT :limit OFFSET :offset",
+            nativeQuery = true)
+-    List<Task> searchTasks(@Param("term") String term, @Param("status") String status);
++    List<Task> searchTasks(@Param("term") String term,
++                           @Param("status") String status,
++                           @Param("limit") int limit,
++                           @Param("offset") int offset);
++
++    // Same filter as above, used for the total count shown in pagination.
++    @Query(value = "SELECT COUNT(*) FROM tasks "
++                 + "WHERE archived = FALSE "
++                 + "AND (LOWER(title) LIKE :term ESCAPE '\\' OR LOWER(description) LIKE :term ESCAPE '\\') "
++                 + "AND (:status IS NULL OR status = :status)",
++           nativeQuery = true)
++    long countTasks(@Param("term") String term, @Param("status") String status);
+ }
+diff --git a/db/oracle/task_search_package.sql b/db/oracle/task_search_package.sql
+index 3cc7748..a163854 100644
+--- a/db/oracle/task_search_package.sql
++++ b/db/oracle/task_search_package.sql
+@@ -50,8 +50,7 @@ CREATE OR REPLACE PACKAGE BODY task_search_pkg AS
+           INTO p_total_count
+           FROM tasks
+          WHERE archived = 0
+-           AND LOWER(title) LIKE v_term
+-            OR LOWER(description) LIKE v_term
++           AND (LOWER(title) LIKE v_term OR LOWER(description) LIKE v_term)
+            AND (p_status IS NULL OR status = p_status);
+ 
+         -- Paginated results using ROWNUM (pre-12c pattern)
+@@ -64,10 +63,9 @@ CREATE OR REPLACE PACKAGE BODY task_search_pkg AS
+                                assignee, created_at
+                           FROM tasks
+                          WHERE archived = 0
+-                           AND LOWER(title) LIKE v_term
+-                            OR LOWER(description) LIKE v_term
++                           AND (LOWER(title) LIKE v_term OR LOWER(description) LIKE v_term)
+                            AND (p_status IS NULL OR status = p_status)
+-                         ORDER BY created_at DESC
++                         ORDER BY created_at DESC, id DESC
+                     ) t
+                    WHERE ROWNUM <= v_offset + p_page_size
+               )
+diff --git a/db/queries/search_tasks.sql b/db/queries/search_tasks.sql
+index 02bf76d..b4846f0 100644
+--- a/db/queries/search_tasks.sql
++++ b/db/queries/search_tasks.sql
+@@ -8,7 +8,6 @@
+ SELECT *
+ FROM tasks
+ WHERE archived = FALSE
+-  AND LOWER(title) LIKE :term
+-   OR LOWER(description) LIKE :term
++  AND (LOWER(title) LIKE :term OR LOWER(description) LIKE :term)
+   AND (:status IS NULL OR status = :status)
+ ORDER BY created_at DESC;
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 5bdac44..20f34c9 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -1,14 +1,30 @@
+-import { useState } from 'react';
++import { useState, useEffect } from 'react';
+ import SearchBar from './components/SearchBar';
+ import StatusFilter from './components/StatusFilter';
+ import TaskTable from './components/TaskTable';
+ import { useTasks } from './hooks/useTasks';
+ 
+ export default function App() {
++  const [searchInput, setSearchInput] = useState('');
+   const [query, setQuery] = useState('');
+   const [status, setStatus] = useState('');
+   const [page, setPage] = useState(1);
+ 
++  // Debounce: only send the request 300ms after the user stops typing,
++  // and go back to page 1 when the search term changes.
++  useEffect(() => {
++    const timer = setTimeout(() => {
++      setQuery(searchInput.trim());
++      setPage(1);
++    }, 300);
++    return () => clearTimeout(timer);
++  }, [searchInput]);
++
++  const handleStatusChange = (value) => {
++    setStatus(value);
++    setPage(1);
++  };
++
+   const { tasks, total, loading, error } = useTasks(query, status, page, 10);
+ 
+   const totalPages = Math.ceil(total / 10);
+@@ -21,8 +37,8 @@ export default function App() {
+       </header>
+ 
+       <div className="controls">
+-        <SearchBar value={query} onChange={setQuery} />
+-        <StatusFilter value={status} onChange={setStatus} />
++        <SearchBar value={searchInput} onChange={setSearchInput} />
++        <StatusFilter value={status} onChange={handleStatusChange} />
+       </div>
+ 
+       <TaskTable tasks={tasks} loading={loading} error={error} />
+diff --git a/frontend/src/hooks/useTasks.js b/frontend/src/hooks/useTasks.js
+index bbaefe1..320035f 100644
+--- a/frontend/src/hooks/useTasks.js
++++ b/frontend/src/hooks/useTasks.js
+@@ -8,17 +8,29 @@ export function useTasks(query, status, page, pageSize) {
+   const [error, setError] = useState(null);
+ 
+   useEffect(() => {
++    // Ignore responses from outdated requests (race condition protection)
++    let ignore = false;
++
+     setLoading(true);
++    setError(null);
+ 
+     fetchTasks({ query, status, page, pageSize })
+       .then((data) => {
++        if (ignore) return;
+         setTasks(data.items);
+         setTotal(data.total);
+-        setLoading(false);
+       })
+       .catch((err) => {
++        if (ignore) return;
+         setError(err.message);
++      })
++      .finally(() => {
++        if (!ignore) setLoading(false);
+       });
++
++    return () => {
++      ignore = true;
++    };
+   }, [query, status, page, pageSize]);
+ 
+   return { tasks, total, loading, error };
